@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "../..,../..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32s3",
+  "hardwareFolders": "/home/hugo/.arduino15/packages/esp32/hardware/esp32/3.3.12,/home/hugo/.arduino15/packages/esp32/hardware/esp32/3.3.12",
+  "otherLibrariesFolders": "/home/hugo/Arduino/libraries",
+  "sketchLocation": "/home/hugo/Project/NeuroMotion/vision_subsystem"
+}
