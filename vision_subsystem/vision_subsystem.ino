@@ -1,40 +1,36 @@
-/**
- * NeuroMotion – Vision Subsystem
- * Board : Seeed Studio XIAO ESP32-S3 Sense
- * Camera: OV2640 (bundled with XIAO S3 Sense)
+/*
+ * ============================================================
+ * NeuroMotion – Vision Subsystem (Eye State Tester)
+ * Board  : Seeed Studio XIAO ESP32-S3 Sense
+ * Camera : OV2640
  *
- * Function:
- *   - Captures a grayscale frame at ~30 fps.
- *   - Runs NeuroMotionCNN TFLite model (96×96 grayscale → open/closed).
- *   - Sends VisionPacket_t via ESP-NOW to the Decision Engine (ESP32-C3).
- *
- * Dependencies (install via Library Manager or PlatformIO):
- *   - "ESP32 Camera" (espressif/esp32-camera, bundled with ESP32 Arduino core 2.x)
- *   - TensorFlow Lite for Microcontrollers (tflm-esp32 or EloquentTinyML)
- *   - ESP-NOW (built-in, via esp_now.h)
- *
- * Model file:
- *   Place the converted TFLite model as a C byte-array header:
- *     vision_subsystem/model_data.h
- *   Generate it with:
- *     xxd -i neuromotion_model_int8.tflite > model_data.h
- *   Then rename the array to `g_model[]` and its size to `g_model_len`.
+ * Mode   : Serial Monitor Tester
+ *   - Runs TFLite Micro INT8 model on 96x96 grayscale frames
+ *   - Prints real-time eye state, confidence, duration, latency
+ *   - Onboard LED ON = CLOSED (drowsy)
+ *   - Broadcasts VisionPacket_t via ESP-NOW to Decision Engine
+ * ============================================================
  */
 
-#define DEBUG_SERIAL 0
-
 #include <Arduino.h>
-#include <esp_now.h>
 #include <WiFi.h>
+#include <esp_now.h>
+
 #include "esp_camera.h"
+
+#include <Chirale_TensorFlowLite.h>
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "model_data.h"          // generated: g_model[], g_model_len
-#include "../shared/config.h"
-#include "camera_stream.h"   // MJPEG stream + /status endpoint on port 9478
 
-// ─── Camera Pin Map (XIAO ESP32-S3 Sense) ────────────────────────────────────
+#include "../shared/config.h"
+#include "model_data.h"
+
+
+// ============================================================
+// CAMERA PINS (XIAO ESP32-S3 Sense)
+// ============================================================
+
 #define PWDN_GPIO_NUM   -1
 #define RESET_GPIO_NUM  -1
 #define XCLK_GPIO_NUM   10
@@ -52,248 +48,344 @@
 #define HREF_GPIO_NUM   47
 #define PCLK_GPIO_NUM   13
 
-// ─── ESP-NOW Packet ───────────────────────────────────────────────────────────
+#define LED_PIN         21
+
+
+// ============================================================
+// TYPES
+// ============================================================
+
 typedef struct {
-    uint8_t  eyeState;      // EYE_OPEN=0, EYE_CLOSED=1
-    uint8_t  confidence;    // 0-100 (%)
-    uint32_t timestamp;     // millis() since boot
+    uint8_t  eyeState;
+    uint8_t  confidence;
+    uint32_t timestamp;
 } VisionPacket_t;
 
-static uint8_t decisionMac[] = DECISION_ENGINE_MAC;
+typedef struct {
+    uint8_t  state;
+    uint8_t  confidence;
+    uint32_t latencyMs;
+} InferenceResult;
 
-// ─── TFLite ───────────────────────────────────────────────────────────────────
-// Tensor arena: 96*96*1 input + model overhead. 128 KB is safe for int8 model.
-static const int kTensorArenaSize = 48 * 1024;
-static uint8_t tensor_arena[kTensorArenaSize];
 
-static tflite::MicroMutableOpResolver<8> resolver;
-static const tflite::Model*              model_ptr  = nullptr;
-static tflite::MicroInterpreter*         interpreter = nullptr;
-static TfLiteTensor*                     input_tensor  = nullptr;
-static TfLiteTensor*                     output_tensor = nullptr;
+// ============================================================
+// TFLite Micro
+// ============================================================
 
-// ─── ESP-NOW Send Callback ────────────────────────────────────────────────────
-void onDataSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
-#if DEBUG_SERIAL
-    Serial.print("[ESP-NOW] Send: ");
-    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
-#endif
+namespace {
+    const tflite::Model*      tfl_model       = nullptr;
+    tflite::MicroInterpreter* tfl_interpreter  = nullptr;
+    TfLiteTensor*             tfl_input        = nullptr;
+
+    constexpr int kArenaSize = 96 * 1024;
+    uint8_t* tensor_arena = nullptr;
+
+    tflite::MicroMutableOpResolver<8> resolver;
 }
 
-// ─── Camera Init ─────────────────────────────────────────────────────────────
+
+// ============================================================
+// ESP-NOW
+// ============================================================
+
+static bool espnowReady = false;
+
+void onDataSent(const esp_now_send_info_t* info, esp_now_send_status_t status) {
+    if (status != ESP_NOW_SEND_SUCCESS) {
+        Serial.println("[ESP-NOW] Send FAILED");
+    }
+}
+
+void initEspNow() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESP-NOW] Init failed — continuing without ESP-NOW");
+        return;
+    }
+
+    esp_now_register_send_cb(onDataSent);
+
+    uint8_t peerMac[] = DECISION_ENGINE_MAC;
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, peerMac, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+
+    if (esp_now_add_peer(&peer) != ESP_OK) {
+        Serial.println("[ESP-NOW] Add peer failed");
+        return;
+    }
+
+    espnowReady = true;
+    Serial.print("[ESP-NOW] Ready | MAC: ");
+    Serial.println(WiFi.macAddress());
+}
+
+void sendVisionPacket(uint8_t state, uint8_t conf) {
+    if (!espnowReady) return;
+    VisionPacket_t pkt;
+    pkt.eyeState   = state;
+    pkt.confidence = conf;
+    pkt.timestamp  = millis();
+    uint8_t peerMac[] = DECISION_ENGINE_MAC;
+    esp_now_send(peerMac, (uint8_t*)&pkt, sizeof(pkt));
+}
+
+
+// ============================================================
+// CAMERA INIT
+// ============================================================
+
 bool initCamera() {
-    camera_config_t cfg;
-    cfg.ledc_channel = LEDC_CHANNEL_0;
-    cfg.ledc_timer   = LEDC_TIMER_0;
-    cfg.pin_d0  = Y2_GPIO_NUM;
-    cfg.pin_d1  = Y3_GPIO_NUM;
-    cfg.pin_d2  = Y4_GPIO_NUM;
-    cfg.pin_d3  = Y5_GPIO_NUM;
-    cfg.pin_d4  = Y6_GPIO_NUM;
-    cfg.pin_d5  = Y7_GPIO_NUM;
-    cfg.pin_d6  = Y8_GPIO_NUM;
-    cfg.pin_d7  = Y9_GPIO_NUM;
-    cfg.pin_xclk  = XCLK_GPIO_NUM;
-    cfg.pin_pclk  = PCLK_GPIO_NUM;
-    cfg.pin_vsync = VSYNC_GPIO_NUM;
-    cfg.pin_href  = HREF_GPIO_NUM;
-    cfg.pin_sscb_sda = SIOD_GPIO_NUM;
-    cfg.pin_sscb_scl = SIOC_GPIO_NUM;
-    cfg.pin_pwdn  = PWDN_GPIO_NUM;
-    cfg.pin_reset = RESET_GPIO_NUM;
-    cfg.xclk_freq_hz = 20000000;
-    cfg.pixel_format = PIXFORMAT_GRAYSCALE;  // grayscale → direct to model
-    cfg.frame_size   = FRAMESIZE_96X96;      // native 96x96, no resize needed
-    cfg.jpeg_quality = 12;
-    cfg.fb_count     = 1;
-    cfg.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
-    cfg.fb_location  = CAMERA_FB_IN_DRAM;   // use DRAM for frame buffer
+    camera_config_t cfg = {};
+    cfg.ledc_channel  = LEDC_CHANNEL_0;
+    cfg.ledc_timer    = LEDC_TIMER_0;
+    cfg.pin_d0        = Y2_GPIO_NUM;
+    cfg.pin_d1        = Y3_GPIO_NUM;
+    cfg.pin_d2        = Y4_GPIO_NUM;
+    cfg.pin_d3        = Y5_GPIO_NUM;
+    cfg.pin_d4        = Y6_GPIO_NUM;
+    cfg.pin_d5        = Y7_GPIO_NUM;
+    cfg.pin_d6        = Y8_GPIO_NUM;
+    cfg.pin_d7        = Y9_GPIO_NUM;
+    cfg.pin_xclk      = XCLK_GPIO_NUM;
+    cfg.pin_pclk      = PCLK_GPIO_NUM;
+    cfg.pin_vsync     = VSYNC_GPIO_NUM;
+    cfg.pin_href      = HREF_GPIO_NUM;
+    cfg.pin_sccb_sda  = SIOD_GPIO_NUM;
+    cfg.pin_sccb_scl  = SIOC_GPIO_NUM;
+    cfg.pin_pwdn      = PWDN_GPIO_NUM;
+    cfg.pin_reset     = RESET_GPIO_NUM;
+    cfg.xclk_freq_hz  = 20000000;
+    cfg.pixel_format  = PIXFORMAT_GRAYSCALE;
+    cfg.frame_size    = FRAMESIZE_96X96;
+    cfg.jpeg_quality  = 12;
+    cfg.fb_count      = 1;
+    cfg.grab_mode     = CAMERA_GRAB_LATEST;
+    cfg.fb_location   = CAMERA_FB_IN_PSRAM;
 
     esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
         Serial.printf("[CAM] Init failed: 0x%x\n", err);
         return false;
     }
-    Serial.println("[CAM] Init OK");
+    Serial.println("[CAM] OK — GRAYSCALE 96x96");
     return true;
 }
 
-// ─── TFLite Init ─────────────────────────────────────────────────────────────
+
+// ============================================================
+// MODEL INIT
+// ============================================================
+
 bool initModel() {
-    model_ptr = tflite::GetModel(g_model);
-    if (model_ptr->version() != TFLITE_SCHEMA_VERSION) {
-        Serial.println("[TFLite] Schema version mismatch!");
+    tensor_arena = (uint8_t*)heap_caps_malloc(kArenaSize, MALLOC_CAP_SPIRAM);
+    if (!tensor_arena) {
+        Serial.println("[MODEL] PSRAM alloc failed");
         return false;
     }
 
-    // Register only needed ops (keeps binary smaller)
+    tfl_model = tflite::GetModel(g_model);
+    if (tfl_model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.printf("[MODEL] Schema mismatch: got %d expected %d\n",
+            tfl_model->version(), TFLITE_SCHEMA_VERSION);
+        return false;
+    }
+
     resolver.AddConv2D();
     resolver.AddDepthwiseConv2D();
     resolver.AddMaxPool2D();
     resolver.AddReshape();
     resolver.AddFullyConnected();
     resolver.AddSoftmax();
+    resolver.AddQuantize();
+    resolver.AddDequantize();
 
-    static tflite::MicroInterpreter static_interpreter(
-        model_ptr, resolver, tensor_arena, kTensorArenaSize);
-    interpreter = &static_interpreter;
+    static tflite::MicroInterpreter static_interp(
+        tfl_model, resolver, tensor_arena, kArenaSize);
+    tfl_interpreter = &static_interp;
 
-    if (interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("[TFLite] AllocateTensors failed!");
+    if (tfl_interpreter->AllocateTensors() != kTfLiteOk) {
+        Serial.println("[MODEL] AllocateTensors failed");
         return false;
     }
 
-    input_tensor  = interpreter->input(0);
-    output_tensor = interpreter->output(0);
+    tfl_input = tfl_interpreter->input(0);
 
-    Serial.printf("[TFLite] Input:  [%d,%d,%d,%d] type=%d\n",
-        input_tensor->dims->data[0], input_tensor->dims->data[1],
-        input_tensor->dims->data[2], input_tensor->dims->data[3],
-        input_tensor->type);
-    Serial.printf("[TFLite] Output: [%d,%d] type=%d\n",
-        output_tensor->dims->data[0], output_tensor->dims->data[1],
-        output_tensor->type);
-    Serial.println("[TFLite] Init OK");
+    Serial.printf("[MODEL] OK — arena used: %u / %d bytes\n",
+        tfl_interpreter->arena_used_bytes(), kArenaSize);
     return true;
 }
 
-// ─── Inference ───────────────────────────────────────────────────────────────
-/**
- * Run inference on a 96x96 grayscale frame.
- * @param  pixels   Pointer to grayscale pixel data (96*96 bytes).
- * @param  eyeState Output: EYE_OPEN or EYE_CLOSED.
- * @param  conf     Output: confidence 0-100.
- * @return true on success.
- */
-bool runInference(const uint8_t* pixels, uint8_t& eyeState, uint8_t& conf) {
-    // Copy pixels into model input, normalized to int8 range
-    // Using quantization params embedded in model_data.h
-    int8_t* inp = input_tensor->data.int8;
-    float input_scale = MODEL_INPUT_SCALE;
-    int32_t input_zp  = MODEL_INPUT_ZP;
-    for (int i = 0; i < MODEL_INPUT_WIDTH * MODEL_INPUT_HEIGHT; i++) {
-        float normalized = (float)pixels[i] / 255.0f;  // [0,1]
-        inp[i] = (int8_t)((int32_t)(normalized / input_scale) + input_zp);
+
+// ============================================================
+// PREPROCESSING
+// ============================================================
+
+void preprocessFrame(const uint8_t* src) {
+    int8_t* dst = tfl_input->data.int8;
+    int     n   = MODEL_INPUT_WIDTH * MODEL_INPUT_HEIGHT;
+    for (int i = 0; i < n; i++) {
+        dst[i] = (int8_t)((int)src[i] - 128);
     }
-
-    if (interpreter->Invoke() != kTfLiteOk) {
-        Serial.println("[TFLite] Invoke failed!");
-        return false;
-    }
-
-    // Output: [open_score, closed_score] — int8 quantized
-    // Dequantize using output tensor's scale + zero_point
-    float output_scale = output_tensor->params.scale;
-    int32_t output_zp  = output_tensor->params.zero_point;
-    int8_t* out        = output_tensor->data.int8;
-    float openConf  = output_scale * (out[EYE_OPEN]   - output_zp);
-    float closedConf= output_scale * (out[EYE_CLOSED] - output_zp);
-
-#if DEBUG_SERIAL
-    Serial.printf("[INF] open=%.3f closed=%.3f\n", openConf, closedConf);
-#endif
-
-    eyeState = (closedConf > openConf) ? EYE_CLOSED : EYE_OPEN;
-    conf     = (uint8_t)(((eyeState == EYE_CLOSED) ? closedConf : openConf) * 100.0f);
-    conf     = (conf > 100) ? 100 : conf;
-    return true;
 }
 
-// ─── Setup ────────────────────────────────────────────────────────────────────
+
+// ============================================================
+// INFERENCE
+// ============================================================
+
+InferenceResult runInference(const camera_fb_t* fb) {
+    preprocessFrame(fb->buf);
+
+    uint32_t t0 = millis();
+    tfl_interpreter->Invoke();
+    uint32_t latency = millis() - t0;
+
+    TfLiteTensor* out = tfl_interpreter->output(0);
+
+    // Output INT8 — index 0=open, index 1=closed
+    // scale=0.07593961, zero_point=-6
+    const float scale = 0.07593961f;
+    const int   zp    = -6;
+
+    float openConf   = (out->data.int8[0] - zp) * scale;
+    float closedConf = (out->data.int8[1] - zp) * scale;
+
+    if (openConf   < 0.0f) openConf   = 0.0f;
+    if (closedConf < 0.0f) closedConf = 0.0f;
+
+    float sum = openConf + closedConf;
+    if (sum > 0.0f) {
+        openConf   /= sum;
+        closedConf /= sum;
+    }
+
+    uint8_t state = (closedConf >= openConf) ? EYE_CLOSED : EYE_OPEN;
+    uint8_t conf  = (uint8_t)((state == EYE_CLOSED ? closedConf : openConf) * 100.0f);
+
+    InferenceResult res;
+    res.state      = state;
+    res.confidence = conf;
+    res.latencyMs  = latency;
+    return res;
+}
+
+
+// ============================================================
+// ASCII CONFIDENCE BAR
+// ============================================================
+
+void printBar(uint8_t pct) {
+    const int W = 10;
+    int filled = (pct * W) / 100;
+    Serial.print('[');
+    for (int i = 0; i < W; i++) Serial.print(i < filled ? '=' : ' ');
+    Serial.print(']');
+}
+
+
+// ============================================================
+// STATE TRACKING
+// ============================================================
+
+static uint32_t closureStartMs    = 0;
+static uint32_t closureDurationMs = 0;
+static bool     eyeWasClosed      = false;
+static uint32_t frameCount        = 0;
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
 void setup() {
     Serial.begin(115200);
-    delay(500);
-    Serial.println("\n[NeuroMotion] Vision Subsystem booting...");
+    delay(2000);
 
-    // Camera
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    Serial.println();
+    Serial.println("╔══════════════════════════════════════════╗");
+    Serial.println("║   NeuroMotion – Eye State Tester         ║");
+    Serial.println("║   Board: XIAO ESP32-S3 Sense             ║");
+    Serial.println("╚══════════════════════════════════════════╝");
+    Serial.printf("[SYS] Free PSRAM : %u bytes\n", ESP.getFreePsram());
+    Serial.printf("[SYS] Free heap  : %u bytes\n", ESP.getFreeHeap());
+
+    initEspNow();
+
     if (!initCamera()) {
-        Serial.println("[FATAL] Camera init failed. Halting.");
-        while (1) delay(1000);
+        Serial.println("[FATAL] Camera init failed — halting.");
+        while (true) delay(1000);
     }
 
-    // TFLite model
     if (!initModel()) {
-        Serial.println("[FATAL] Model init failed. Halting.");
-        while (1) delay(1000);
+        Serial.println("[FATAL] Model init failed — halting.");
+        while (true) delay(1000);
     }
 
-    // Wi-Fi in STA mode (required for ESP-NOW)
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    Serial.print("[WIFI] MAC: ");
-    Serial.println(WiFi.macAddress());
-
-    // ESP-NOW
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("[FATAL] ESP-NOW init failed. Halting.");
-        while (1) delay(1000);
-    }
-    esp_now_register_send_cb(onDataSent);
-
-    // Start camera stream server (port 9478)
-    String camIP = streamServerInit();
-    Serial.printf("[STREAM] Camera accessible at http://%s:%d/\n", camIP.c_str(), STREAM_PORT);
-
-    // Register Decision Engine as peer
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, decisionMac, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-    if (esp_now_add_peer(&peer) != ESP_OK) {
-        Serial.println("[WARN] Failed to add Decision Engine peer — check MAC.");
-    }
-
-    Serial.println("[NeuroMotion] Vision Subsystem ready.");
+    Serial.println();
+    Serial.println("──────────────────────────────────────────────────────────────────────");
+    Serial.println(" State   │ Conf  Bar          │  Duration  │ Latency │ Action");
+    Serial.println("──────────────────────────────────────────────────────────────────────");
 }
 
-// ─── Loop ─────────────────────────────────────────────────────────────────────
-void loop() {
-    unsigned long frameStart = millis();
 
-    // Capture frame
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
-        Serial.println("[CAM] Frame capture failed");
+        Serial.println("[CAM] Capture failed");
         delay(VISION_LOOP_MS);
         return;
     }
 
-    // Sanity check: expect 96*96 greyscale bytes
-    if (fb->len != (MODEL_INPUT_WIDTH * MODEL_INPUT_HEIGHT)) {
-        Serial.printf("[CAM] Unexpected frame size: %d\n", fb->len);
-        esp_camera_fb_return(fb);
-        delay(VISION_LOOP_MS);
-        return;
-    }
-
-    // Run inference
-    uint8_t eyeState = EYE_OPEN;
-    uint8_t conf     = 0;
-    bool ok = runInference(fb->buf, eyeState, conf);
+    InferenceResult res = runInference(fb);
     esp_camera_fb_return(fb);
+    frameCount++;
 
-    if (!ok) {
-        delay(VISION_LOOP_MS);
-        return;
+    if (res.state == EYE_CLOSED) {
+        if (!eyeWasClosed) {
+            closureStartMs = millis();
+            eyeWasClosed   = true;
+        }
+        closureDurationMs = millis() - closureStartMs;
+    } else {
+        eyeWasClosed      = false;
+        closureDurationMs = 0;
+        closureStartMs    = 0;
     }
 
-    // Update stream status endpoint
-    streamUpdateState(eyeState, conf, (float)conf / 100.0f);
+    digitalWrite(LED_PIN, res.state == EYE_CLOSED ? HIGH : LOW);
 
-    // Build and send ESP-NOW packet
-    VisionPacket_t pkt;
-    pkt.eyeState  = eyeState;
-    pkt.confidence= conf;
-    pkt.timestamp = millis();
+    bool alert = (res.state == EYE_CLOSED) && (closureDurationMs >= MIN_CLOSURE_MS);
 
-    esp_now_send(decisionMac, (uint8_t*)&pkt, sizeof(pkt));
+    Serial.printf(" %-6s  │ %3d%% ",
+        res.state == EYE_CLOSED ? "CLOSED" : "OPEN",
+        res.confidence);
+    printBar(res.confidence);
+    Serial.printf(" │ %6lu ms  │ %4lu ms │ %s\n",
+        closureDurationMs,
+        res.latencyMs,
+        alert ? "<<< ALERT (ESP-NOW SENT)" : "normal");
 
-    // Maintain ~30 fps
-    unsigned long elapsed = millis() - frameStart;
-    if (elapsed < VISION_LOOP_MS) {
-        delay(VISION_LOOP_MS - elapsed);
+    if (alert) {
+        sendVisionPacket(res.state, res.confidence);
     }
 
-    // Handle HTTP clients (streaming)
-    streamServerLoop();
+    if (frameCount % 50 == 0) {
+        Serial.println("──────────────────────────────────────────────────────────────────────");
+        Serial.printf(" Frame: %-6lu  Free heap: %-8u  Free PSRAM: %u\n",
+            frameCount, ESP.getFreeHeap(), ESP.getFreePsram());
+        Serial.println("──────────────────────────────────────────────────────────────────────");
+    }
+
+    delay(VISION_LOOP_MS);
 }
